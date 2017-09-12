@@ -1,0 +1,189 @@
+#! /usr/bin/env python
+
+'''
+Tweet from RSS feeds
+'''
+
+import sys
+import os
+import logging
+import re
+import time
+import yaml
+import daemon
+import twitter
+import requests_oauthlib
+import feedparser
+
+REQUEST_TOKEN_URL = 'https://api.twitter.com/oauth/request_token'
+AUTHORIZATION_URL = 'https://api.twitter.com/oauth/authorize'
+ACCESS_TOKEN_URL = 'https://api.twitter.com/oauth/access_token'
+
+RESENTENCE = re.compile(r'( *[.!?] *)')
+RESPACE = re.compile(r'\s+')
+REPUNCT = re.compile(r'.*[.!?]$')
+TWEETED = os.path.expanduser('~/.twitrss/tweeted.yaml')
+
+def authorise(consumerkey, consumersecret):
+    '''
+    Authorise application
+    '''
+
+    sess = requests_oauthlib.OAuth1Session(consumerkey, consumersecret)
+    resp = sess.fetch_request_token(REQUEST_TOKEN_URL)
+    logging.info(sess.authorization_url(AUTHORIZATION_URL))
+
+    pin = input('PIN? ')
+    sess = requests_oauthlib.OAuth1Session(consumerkey,
+                                           consumersecret,
+                                           resp.get('oauth_token'),
+                                           resp.get('oauth_token_secret'),
+                                           verifier=str(pin))
+    resp = sess.fetch_access_token(ACCESS_TOKEN_URL)
+
+    logging.info("access-token: '%s'", resp.get('oauth_token'))
+    logging.info("access-token-secret: '%s'", resp.get('oauth_token_secret'))
+
+
+def authenticate(cfg):
+    '''
+    Authenticate
+    '''
+
+    try:
+        # This doesn't seem to interact with the Twitter service yet
+        return twitter.Api(
+            consumer_key=cfg['auth']['consumer-key'],
+            consumer_secret=cfg['auth']['consumer-secret'],
+            access_token_key=cfg['auth']['access-token'],
+            access_token_secret=cfg['auth']['access-token-secret'])
+    except KeyError, exc:
+        logging.warn("Missing authentication key: %s", exc)
+
+def shorten(txt, specials):
+    '''
+    Shorten text
+    '''
+
+    for special in specials:
+        txt = re.sub(special, specials[special], txt)
+
+    return txt
+
+
+def getsentences(title, summary, dotitle, url, limit, specials):
+    '''
+    Get as many sentences as possible below the limit
+    '''
+
+    length = 0
+    chunks = []
+
+    if dotitle:
+        if REPUNCT.match(title):
+            title += ' '
+        else:
+            title += ': '
+        title = shorten(title, specials)
+        length += len(title)
+        chunks.append(title)
+
+    if url:
+        length += 25 # 24 for the short URL + a space
+
+    for chunk in RESENTENCE.split(summary):
+        chunk = shorten(chunk, specials)
+        length += len(chunk)
+        if length > limit:
+            break
+        chunks.append(chunk)
+
+    if url:
+        chunks.append(' ' + url)
+
+    return RESPACE.sub(' ', ''.join(chunks))
+
+
+def loop(cfg):
+    '''
+    Main loop
+    '''
+
+    # Set up logging
+    level = logging.DEBUG \
+        if 'debug' in cfg['run'] and cfg['run']['debug'] \
+        else logging.INFO
+    logging.basicConfig(
+        filename=os.path.expanduser('~/.twitrss/twitrss.log'),
+        format='%(asctime)s %(levelname)s %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+        level=level,
+    )
+
+    logging.info("Starting run")
+
+    # Auth
+    logging.info("Authorising")
+    if not ('access-token' in cfg['auth'] or 'access-token' in cfg['auth']):
+        authorise(cfg['auth']['consumer-key'], cfg['auth']['consumer-secret'])
+    logging.info("Authenticating")
+    api = authenticate(cfg)
+
+    while True:
+        # Load what was already tweeted
+        try:
+            with open(TWEETED) as fhl:
+                tweeted = yaml.load(fhl)
+        except IOError:
+            tweeted = []
+
+        # Parse feed and tweet
+        for entry in feedparser.parse(cfg['url'])['entries']:
+            sentences = getsentences(entry['title'],
+                                     entry['summary'],
+                                     cfg['tweet']['title'],
+                                     cfg['tweet']['url'],
+                                     cfg['tweet']['limit'],
+                                     cfg['tweet']['specials'])
+
+            if sentences and sentences not in tweeted:
+                logging.info('Tweeting "%s"', sentences)
+                if not ('dryrun' in cfg['run'] and cfg['run']['dryrun']):
+                    api.PostUpdate(sentences)
+                if not ('notrack' in cfg['run'] and cfg['run']['notrack']):
+                    tweeted.append(sentences)
+
+        # Track what we tweeted
+        try:
+            with open(TWEETED, 'w') as fhl:
+                yaml.dump(tweeted, fhl, default_flow_style=False)
+        except IOError:
+            pass
+
+        if 'sleep' in cfg:
+            time.sleep(cfg['sleep'])
+        else:
+            break
+
+    logging.info("Ending run")
+
+
+def main():
+    '''
+    Load config
+    '''
+
+    # Load config
+    with open(os.path.expanduser('~/.twitrss/twitrss.yaml')) as fhl:
+        cfg = yaml.load(fhl)
+
+    # Daemonise?
+    if 'daemon' in cfg['run'] and cfg['run']['daemon']:
+        with daemon.DaemonContext():
+            loop(cfg)
+    else:
+        loop(cfg)
+
+
+if __name__ == '__main__':
+    sys.exit(main())
